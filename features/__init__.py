@@ -13,7 +13,9 @@ from .market import (
 from .sector import (
     SectorHeatResult,
     calculate_sector_heat,
-    calculate_all_sectors_heat
+    calculate_all_sectors_heat,
+    calculate_diffusion_metrics,
+    clear_diffusion_cache
 )
 from .stock import (
     StockHeatResult,
@@ -32,6 +34,8 @@ __all__ = [
     "SectorHeatResult",
     "calculate_sector_heat",
     "calculate_all_sectors_heat",
+    "calculate_diffusion_metrics",
+    "clear_diffusion_cache",
     "StockHeatResult",
     "calculate_stock_heat",
     "filter_stocks_by_criteria",
