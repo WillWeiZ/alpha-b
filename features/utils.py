@@ -2,7 +2,8 @@
 
 import numpy as np
 import pandas as pd
-from typing import Optional, List
+from typing import Optional, List, Tuple
+from decimal import Decimal, ROUND_HALF_UP
 
 
 def ema(series: pd.Series, n: int) -> pd.Series:
@@ -135,3 +136,69 @@ def map_to_7state(score: float) -> str:
         return "热"
     else:
         return "沸"
+
+
+def calculate_limit_prices(stock_code: str, pre_close: float, trade_date: str) -> Tuple[float, float]:
+    """
+    精准计算涨跌停价格
+
+    Args:
+        stock_code: 股票代码，如 "600000.SH"
+        pre_close: 前收盘价
+        trade_date: 交易日期 (YYYYMMDD格式)
+
+    Returns:
+        (涨停价, 跌停价)
+    """
+    if pd.isna(pre_close) or pre_close <= 0:
+        return None, None
+
+    # 解析股票代码
+    code_prefix = stock_code.split('.')[0] if '.' in stock_code else stock_code
+
+    # 判断涨跌幅限制
+    # 2020年8月4日后的新规则
+    trade_dt = pd.to_datetime(trade_date, format='%Y%m%d', errors='coerce')
+    if trade_dt is None or pd.isna(trade_dt):
+        trade_dt = pd.Timestamp.now()
+
+    is_after_20200804 = trade_dt > pd.to_datetime('2020-08-03')
+
+    # 默认涨跌幅限制
+    limit_ratio = 0.10  # 普通股票 10%
+
+    # 北交所 (BJ) - 30%
+    if stock_code.endswith('.BJ'):
+        limit_ratio = 0.30
+    # 科创板 (68) - 20%
+    elif code_prefix.startswith('68'):
+        limit_ratio = 0.20
+    # 创业板 (30) - 20%
+    elif code_prefix.startswith('30'):
+        limit_ratio = 0.20
+
+    # 计算涨跌停价格
+    limit_up_price = pre_close * (1 + limit_ratio)
+    limit_down_price = pre_close * (1 - limit_ratio)
+
+    # 使用严格的四舍五入到分
+    limit_up_price = float(Decimal(limit_up_price * 100).quantize(Decimal('1'), rounding=ROUND_HALF_UP) / 100)
+    limit_down_price = float(Decimal(limit_down_price * 100).quantize(Decimal('1'), rounding=ROUND_HALF_UP) / 100)
+
+    return limit_up_price, limit_down_price
+
+
+def is_limit_up(close: float, pre_close: float, stock_code: str, trade_date: str) -> bool:
+    """判断是否涨停"""
+    limit_up, _ = calculate_limit_prices(stock_code, pre_close, trade_date)
+    if limit_up is None:
+        return False
+    return close >= limit_up
+
+
+def is_limit_down(close: float, pre_close: float, stock_code: str, trade_date: str) -> bool:
+    """判断是否跌停"""
+    _, limit_down = calculate_limit_prices(stock_code, pre_close, trade_date)
+    if limit_down is None:
+        return False
+    return close <= limit_down

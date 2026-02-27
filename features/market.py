@@ -1,19 +1,195 @@
 # 大盘 MarketHeat 特征计算
 #
-# 数据来源: QuestDB index_bars 表
+# 数据来源: QuestDB index_bars 表, daily_bars 表
 
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
+from datetime import datetime, timedelta
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from features.utils import (
     ema, sma, percentile_rank_rolling, winsorize,
-    calculate_returns, normalize, map_to_7state
+    calculate_returns, normalize, map_to_7state,
+    calculate_limit_prices
 )
+from data import get_questdb_client
+
+
+# 市场广度缓存
+_market_breadth_cache: Dict[str, Dict[str, int]] = {}
+
+
+def calculate_market_breadth(trade_date: str = None, use_cache: bool = True) -> Dict[str, int]:
+    """
+    计算市场广度数据（从 daily_bars 推算）
+
+    Args:
+        trade_date: 交易日期 (YYYYMMDD格式)，默认为最新交易日
+        use_cache: 是否使用缓存
+
+    Returns:
+        {
+            'up_count': 上涨家数,
+            'down_count': 下跌家数,
+            'limit_up_count': 涨停家数,
+            'limit_down_count': 跌停家数,
+            'total_count': 总家数,
+            'trade_date': 交易日期
+        }
+    """
+    global _market_breadth_cache
+
+    if trade_date is None:
+        # 获取最新交易日期
+        qdb = get_questdb_client()
+        result = qdb.execute("SELECT max(ts) FROM daily_bars")
+        if result is not None and not result.empty:
+            max_ts = result.iloc[0, 0]
+            if max_ts:
+                trade_date = str(max_ts)[:10].replace('-', '')
+
+    if not trade_date:
+        trade_date = datetime.now().strftime('%Y%m%d')
+
+    cache_key = trade_date
+    if use_cache and cache_key in _market_breadth_cache:
+        return _market_breadth_cache[cache_key]
+
+    qdb = get_questdb_client()
+
+    # 解析交易日期
+    dt = datetime.strptime(trade_date, '%Y%m%d')
+    date_str = dt.strftime('%Y-%m-%d')
+    next_dt = dt + timedelta(days=1)
+    next_date_str = next_dt.strftime('%Y-%m-%d')
+
+    # 获取当日的行情数据
+    query = f"""
+    SELECT symbol, close, open
+    FROM daily_bars
+    WHERE ts >= '{date_str}'
+    AND ts < '{next_date_str}'
+    """
+    df = qdb.execute(query)
+
+    # 如果当日没有数据，尝试获取前一天的数据
+    if df is None or df.empty:
+        dt = dt - timedelta(days=1)
+        date_str = dt.strftime('%Y-%m-%d')
+        next_dt = dt + timedelta(days=1)
+        next_date_str = next_dt.strftime('%Y-%m-%d')
+        query = f"""
+        SELECT symbol, close, open
+        FROM daily_bars
+        WHERE ts >= '{date_str}'
+        AND ts < '{next_date_str}'
+        """
+        df = qdb.execute(query)
+
+        if df is None or df.empty:
+            # 回退：使用 open 作为前收盘价的近似
+            return _market_breadth_cache.get(cache_key, {
+                'up_count': 0, 'down_count': 0,
+                'limit_up_count': 0, 'limit_down_count': 0,
+                'total_count': 0, 'trade_date': trade_date
+            })
+
+    # 获取前一天的收盘价
+    dt = datetime.strptime(trade_date, '%Y%m%d') - timedelta(days=1)
+    prev_date_str = dt.strftime('%Y-%m-%d')
+    prev_next_dt = dt + timedelta(days=1)
+    prev_next_date_str = prev_next_dt.strftime('%Y-%m-%d')
+
+    prev_query = f"""
+    SELECT symbol, close as pre_close
+    FROM daily_bars
+    WHERE ts >= '{prev_date_str}'
+    AND ts < '{prev_next_date_str}'
+    """
+    prev_df = qdb.execute(prev_query)
+
+    # 创建前收盘价映射
+    pre_close_map = {}
+    if prev_df is not None and not prev_df.empty:
+        for _, row in prev_df.iterrows():
+            pre_close_map[row['symbol']] = row['pre_close']
+
+    # 统计涨跌停
+    up_count = 0
+    down_count = 0
+    limit_up_count = 0
+    limit_down_count = 0
+
+    for _, row in df.iterrows():
+        symbol = row['symbol']
+        close = row.get('close')
+        open_price = row.get('open', close)
+
+        if pd.isna(close) or pd.isna(open_price):
+            continue
+
+        # 获取前收盘价
+        pre_close = pre_close_map.get(symbol, open_price)
+        if pd.isna(pre_close) or pre_close <= 0:
+            pre_close = open_price  # 使用开盘价作为近似
+
+        # 计算涨跌幅
+        change_pct = (close - pre_close) / pre_close * 100 if pre_close > 0 else 0
+
+        # 判断涨跌
+        if change_pct > 0:
+            up_count += 1
+        elif change_pct < 0:
+            down_count += 1
+
+        # 判断涨跌停（使用精确计算）
+        limit_up, limit_down = calculate_limit_prices(symbol, pre_close, trade_date)
+        if limit_up and close >= limit_up:
+            limit_up_count += 1
+        if limit_down and close <= limit_down:
+            limit_down_count += 1
+
+    total_count = up_count + down_count
+
+    result = {
+        'up_count': up_count,
+        'down_count': down_count,
+        'limit_up_count': limit_up_count,
+        'limit_down_count': limit_down_count,
+        'total_count': total_count,
+        'trade_date': trade_date
+    }
+
+    if use_cache:
+        _market_breadth_cache[cache_key] = result
+
+    return result
+
+
+def get_market_breadth_for_date(trade_date: str) -> Dict[str, int]:
+    """
+    获取指定日期的市场广度（清除缓存强制重新计算）
+
+    Args:
+        trade_date: 交易日期 (YYYYMMDD格式)
+
+    Returns:
+        市场广度数据字典
+    """
+    global _market_breadth_cache
+    # 清除该日期的缓存
+    _market_breadth_cache.pop(trade_date, None)
+    return calculate_market_breadth(trade_date, use_cache=False)
+
+
+def clear_market_breadth_cache():
+    """清除市场广度缓存"""
+    global _market_breadth_cache
+    _market_breadth_cache = {}
 
 
 @dataclass
@@ -47,7 +223,8 @@ class MarketHeatResult:
 def calculate_market_heat(
     market_bars: pd.DataFrame,
     market_breadth: Optional[pd.DataFrame] = None,
-    lookback: int = 252
+    lookback: int = 252,
+    trade_date: str = None
 ) -> MarketHeatResult:
     """
     计算 MarketHeat 大盘热度
@@ -55,20 +232,50 @@ def calculate_market_heat(
     Args:
         market_bars: 大盘指数K线，包含 open/high/low/close/volume
         market_breadth: 市场广度数据 (up_count, down_count, limit_up_count, limit_down_count)
+                       如果为 None，将从 daily_bars 自动计算
         lookback: 回看天数
+        trade_date: 交易日期 (YYYYMMDD格式)，用于计算市场广度
 
     Returns:
         MarketHeatResult
     """
-    if len(market_bars) < 60:
+    if market_bars is not None and len(market_bars) < 60:
         # 数据不够，返回默认值
         return _default_market_heat()
 
-    close = market_bars["close"]
-    open_price = market_bars["open"]
-    high = market_bars["high"]
-    low = market_bars["low"]
-    volume = market_bars["volume"]
+    # 如果没有提供市场广度数据，自动计算
+    if market_breadth is None:
+        breadth_data = calculate_market_breadth(trade_date)
+        up_count = breadth_data.get('up_count', 0)
+        down_count = breadth_data.get('down_count', 0)
+        limit_up = breadth_data.get('limit_up_count', 0)
+        limit_down = breadth_data.get('limit_down_count', 0)
+    elif isinstance(market_breadth, dict):
+        # 传入的是字典格式
+        up_count = market_breadth.get('up_count', 0)
+        down_count = market_breadth.get('down_count', 0)
+        limit_up = market_breadth.get('limit_up_count', 0)
+        limit_down = market_breadth.get('limit_down_count', 0)
+    else:
+        # 传入的是 DataFrame 格式（兼容旧代码）
+        up_count = market_breadth["up_count"].iloc[-1] if "up_count" in market_breadth.columns else 0
+        down_count = market_breadth["down_count"].iloc[-1] if "down_count" in market_breadth.columns else 0
+        limit_up = market_breadth.get("limit_up_count", pd.Series([0])).iloc[-1]
+        limit_down = market_breadth.get("limit_down_count", pd.Series([0])).iloc[-1]
+
+    # 如果没有 market_bars，创建空数据框用于后续计算
+    if market_bars is None or len(market_bars) == 0:
+        close = pd.Series([0])
+        open_price = pd.Series([0])
+        high = pd.Series([0])
+        low = pd.Series([0])
+        volume = pd.Series([0])
+    else:
+        close = market_bars["close"]
+        open_price = market_bars["open"]
+        high = market_bars["high"]
+        low = market_bars["low"]
+        volume = market_bars["volume"]
 
     # === 1. TrendScore（趋势结构）40% ===
     ema20 = ema(close, 20)
@@ -89,22 +296,12 @@ def calculate_market_heat(
     trend_score = (40 * trend_1 + 30 * trend_2 / 100 + 30 * trend_3 / 100)
 
     # === 2. BreadthScore（赚钱效应）35% ===
-    if market_breadth is not None and len(market_breadth) > 0:
-        up_count = market_breadth["up_count"].iloc[-1]
-        down_count = market_breadth["down_count"].iloc[-1]
-        limit_up = market_breadth.get("limit_up_count", pd.Series([0])).iloc[-1]
-        limit_down = market_breadth.get("limit_down_count", pd.Series([0])).iloc[-1]
+    # 上涨家数比
+    total = up_count + down_count
+    adv_ratio = up_count / total if total > 0 else 0.5
 
-        # 上涨家数比
-        total = up_count + down_count
-        adv_ratio = up_count / total if total > 0 else 0.5
-
-        # 涨跌停差
-        limit_spread = limit_up - limit_down
-    else:
-        # 估算：用K线估算
-        adv_ratio = 0.5
-        limit_spread = 0
+    # 涨跌停差
+    limit_spread = limit_up - limit_down
 
     # BreadthScore 合成 (归一化到 0-100)
     # 40% * adv_ratio分位 + 30% * limit_spread分位 + 30% * 分布得分(默认50)
@@ -122,7 +319,7 @@ def calculate_market_heat(
 
     # === 4. LiquidityScore（参与度）15% ===
     # 需要市场总成交量，这里用大盘成交量代替
-    if "total_volume" in market_bars.columns:
+    if market_bars is not None and "total_volume" in market_bars.columns:
         total_vol = market_bars["total_volume"]
     else:
         total_vol = volume
