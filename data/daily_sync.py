@@ -166,8 +166,8 @@ def sync_daily_bars():
     """同步个股日线数据"""
     logger.info("=== 同步个股日线 ===")
 
-    # 获取需要更新的股票列表
-    result = execute("SELECT DISTINCT symbol FROM concept_constituents")
+    # 获取需要更新的股票列表（排除北交所）
+    result = execute("SELECT DISTINCT symbol FROM concept_constituents WHERE symbol NOT LIKE '%BJ'")
     symbols = [r[0] for r in result['dataset']] if result else []
     logger.info(f"股票数量: {len(symbols)}")
 

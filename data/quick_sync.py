@@ -28,9 +28,9 @@ def timestamp_to_ts(ts_ms):
     dt = dt + timedelta(hours=8)
     return dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] + 'Z'
 
-# 获取股票列表
+# 获取股票列表（排除北交所）
 print("获取股票列表...")
-result = execute("SELECT DISTINCT symbol FROM concept_constituents")
+result = execute("SELECT DISTINCT symbol FROM concept_constituents WHERE symbol NOT LIKE '%BJ'")
 symbols = [r[0] for r in result['dataset']] if result else []
 print(f"股票数量: {len(symbols)}")
 

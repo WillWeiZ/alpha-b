@@ -20,9 +20,9 @@ def execute(query):
         return None
     return result
 
-# 1. 从 concept_constituents 获取前10只股票
+# 1. 从 concept_constituents 获取前10只股票（排除北交所）
 print("=== 1. 获取股票列表 ===")
-result = execute("SELECT DISTINCT symbol FROM concept_constituents LIMIT 10")
+result = execute("SELECT DISTINCT symbol FROM concept_constituents WHERE symbol NOT LIKE '%BJ' LIMIT 10")
 symbols = [r[0] for r in result['dataset']] if result else []
 print(f"股票: {symbols}")
 
